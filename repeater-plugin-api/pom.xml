@@ -31,6 +31,10 @@
             <artifactId>metainf-services</artifactId>
             <scope>compile</scope>
         </dependency>
+        <dependency>
+            <groupId>com.alibaba.jvm.sandbox</groupId>
+            <artifactId>repeater-aide</artifactId>
+        </dependency>
     </dependencies>
 
 </project>

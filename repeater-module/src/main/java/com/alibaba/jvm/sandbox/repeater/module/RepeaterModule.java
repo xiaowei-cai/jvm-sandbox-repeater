@@ -3,35 +3,37 @@ package com.alibaba.jvm.sandbox.repeater.module;
 import com.alibaba.jvm.sandbox.api.Information;
 import com.alibaba.jvm.sandbox.api.Information.Mode;
 import com.alibaba.jvm.sandbox.api.Module;
+import com.alibaba.jvm.sandbox.api.ModuleException;
 import com.alibaba.jvm.sandbox.api.ModuleLifecycle;
 import com.alibaba.jvm.sandbox.api.annotation.Command;
-import com.alibaba.jvm.sandbox.api.resource.ConfigInfo;
-import com.alibaba.jvm.sandbox.api.resource.LoadedClassDataSource;
-import com.alibaba.jvm.sandbox.api.resource.ModuleController;
-import com.alibaba.jvm.sandbox.api.resource.ModuleEventWatcher;
+import com.alibaba.jvm.sandbox.api.resource.*;
 import com.alibaba.jvm.sandbox.repeater.module.advice.SpringInstantiateAdvice;
 import com.alibaba.jvm.sandbox.repeater.module.classloader.PluginClassLoader;
+import com.alibaba.jvm.sandbox.repeater.module.classloader.PluginClassRouting;
 import com.alibaba.jvm.sandbox.repeater.module.impl.JarFileLifeCycleManager;
 import com.alibaba.jvm.sandbox.repeater.module.util.LogbackUtils;
-import com.alibaba.jvm.sandbox.repeater.plugin.api.ConfigManager;
-import com.alibaba.jvm.sandbox.repeater.plugin.core.StandaloneSwitch;
-import com.alibaba.jvm.sandbox.repeater.plugin.core.impl.api.DefaultInvocationListener;
-import com.alibaba.jvm.sandbox.repeater.plugin.core.util.PathUtils;
 import com.alibaba.jvm.sandbox.repeater.plugin.Constants;
 import com.alibaba.jvm.sandbox.repeater.plugin.api.Broadcaster;
+import com.alibaba.jvm.sandbox.repeater.plugin.api.ConfigManager;
 import com.alibaba.jvm.sandbox.repeater.plugin.api.InvocationListener;
 import com.alibaba.jvm.sandbox.repeater.plugin.api.LifecycleManager;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.StandaloneSwitch;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.bridge.ClassloaderBridge;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.bridge.RepeaterBridge;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.eventbus.EventBusInner;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.eventbus.RepeatEvent;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.impl.api.DefaultInvocationListener;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.model.ApplicationModel;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.serialize.SerializeException;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.serialize.Serializer;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.serialize.SerializerProvider;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.spring.SpringContextInnerContainer;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.trace.TtlConcurrentAdvice;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.util.ExecutorInner;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.util.PathUtils;
+import com.alibaba.jvm.sandbox.repeater.plugin.core.util.PropertyUtil;
 import com.alibaba.jvm.sandbox.repeater.plugin.core.wrapper.SerializerWrapper;
-import com.alibaba.jvm.sandbox.repeater.plugin.domain.InvokeType;
+import com.alibaba.jvm.sandbox.repeater.plugin.domain.RepeatMeta;
 import com.alibaba.jvm.sandbox.repeater.plugin.domain.RepeaterConfig;
 import com.alibaba.jvm.sandbox.repeater.plugin.domain.RepeaterResult;
 import com.alibaba.jvm.sandbox.repeater.plugin.exception.PluginLifeCycleException;
@@ -49,6 +51,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static com.alibaba.jvm.sandbox.repeater.plugin.Constants.REPEAT_SPRING_ADVICE_SWITCH;
 
 /**
  * <p>
@@ -71,6 +75,9 @@ public class RepeaterModule implements Module, ModuleLifecycle {
     private ConfigInfo configInfo;
 
     @Resource
+    private ModuleManager moduleManager;
+
+    @Resource
     private LoadedClassDataSource loadedClassDataSource;
 
     private Broadcaster broadcaster;
@@ -83,6 +90,8 @@ public class RepeaterModule implements Module, ModuleLifecycle {
 
     private List<InvokePlugin> invokePlugins;
 
+    private HeartbeatHandler heartbeatHandler;
+
     private AtomicBoolean initialized = new AtomicBoolean(false);
 
     @Override
@@ -92,7 +101,7 @@ public class RepeaterModule implements Module, ModuleLifecycle {
         Mode mode = configInfo.getMode();
         log.info("module on loaded,id={},version={},mode={}", com.alibaba.jvm.sandbox.repeater.module.Constants.MODULE_ID, com.alibaba.jvm.sandbox.repeater.module.Constants.VERSION, mode);
         /* agent方式启动 */
-        if (mode == Mode.AGENT) {
+        if (mode == Mode.AGENT && Boolean.valueOf(PropertyUtil.getPropertyOrDefault(REPEAT_SPRING_ADVICE_SWITCH, ""))) {
             log.info("agent launch mode,use Spring Instantiate Advice to register bean.");
             SpringContextInnerContainer.setAgentLaunch(true);
             SpringInstantiateAdvice.watcher(this.eventWatcher).watch();
@@ -105,6 +114,7 @@ public class RepeaterModule implements Module, ModuleLifecycle {
         if (lifecycleManager != null) {
             lifecycleManager.release();
         }
+        heartbeatHandler.stop();
     }
 
     @Override
@@ -133,6 +143,8 @@ public class RepeaterModule implements Module, ModuleLifecycle {
                 }
             }
         });
+        heartbeatHandler = new HeartbeatHandler(configInfo, moduleManager);
+        heartbeatHandler.start();
     }
 
     /**
@@ -143,32 +155,9 @@ public class RepeaterModule implements Module, ModuleLifecycle {
     private synchronized void initialize(RepeaterConfig config) {
         if (initialized.compareAndSet(false, true)) {
             try {
-                // http需要特殊路由操作，使用到容器里面的servlet-api
-                PluginClassLoader.Routing[] routingArray = null;
-                if (config.getPluginIdentities().contains(InvokeType.HTTP.name())) {
-                    int retryTime = 60;
-                    // Agent启动方式下类可能为加载完
-                    while (configInfo.getMode() == Mode.AGENT && --retryTime > 0
-                            && ClassloaderBridge.instance().findClassInstances(Constants.SERVLET_API_NAME).size() == 0) {
-                        try {
-                            log.info("http plugin required servlet-api class router,waiting for class loading");
-                            Thread.sleep(1000);
-                        } catch (InterruptedException e) {
-                            // ignore
-                        }
-                    }
-                    List<Class<?>> instances = ClassloaderBridge.instance().findClassInstances(Constants.SERVLET_API_NAME);
-                    if (instances.size() > 1) {
-                        throw new RuntimeException("found multiple servlet-api loaded in container, can't use http plugin");
-                    }
-                    if (instances.size() == 1){
-                        Class<?> aClass = instances.get(0);
-                        routingArray = new PluginClassLoader.Routing[]{new PluginClassLoader.Routing(aClass.getClassLoader(), "^javax.servlet..*")};
-                    } else {
-                        config.getPluginIdentities().remove(InvokeType.HTTP.name());
-                        log.info("http plugin required servlet-api class router, but found no valid class in classloader, ignore http plugin");
-                    }
-                }
+                ApplicationModel.instance().setConfig(config);
+                // 特殊路由表;
+                PluginClassLoader.Routing[] routingArray = PluginClassRouting.wellKnownRouting(configInfo.getMode() == Mode.AGENT, 20L);
                 String pluginsPath;
                 if (StringUtils.isEmpty(config.getPluginsPath())) {
                     pluginsPath = PathUtils.getPluginPath();
@@ -178,12 +167,12 @@ public class RepeaterModule implements Module, ModuleLifecycle {
                 lifecycleManager = new JarFileLifeCycleManager(pluginsPath, routingArray);
                 // 装载插件
                 invokePlugins = lifecycleManager.loadInvokePlugins();
-                ApplicationModel.instance().setConfig(config);
                 for (InvokePlugin invokePlugin : invokePlugins) {
                     try {
                         if (invokePlugin.enable(config)) {
                             log.info("enable plugin {} success", invokePlugin.identity());
                             invokePlugin.watch(eventWatcher, invocationListener);
+                            invokePlugin.onConfigChange(config);
                         }
                     } catch (PluginLifeCycleException e) {
                         log.info("watch plugin occurred error", e);
@@ -238,6 +227,67 @@ public class RepeaterModule implements Module, ModuleLifecycle {
     }
 
     /**
+     * 重新加载插件
+     *
+     * @param req    请求参数
+     * @param writer printWriter
+     */
+    @Command("reload")
+    public void reload(final Map<String, String> req, final PrintWriter writer) {
+        try {
+            if (initialized.compareAndSet(true,false)) {
+                reload();
+                initialized.compareAndSet(false, true);
+            }
+        } catch (Throwable throwable) {
+            writer.write(throwable.getMessage());
+            initialized.compareAndSet(false, true);
+        }
+    }
+
+    private synchronized void reload() throws ModuleException {
+        moduleController.frozen();
+        // unwatch all plugin
+        RepeaterResult<RepeaterConfig> result = configManager.pullConfig();
+        if (!result.isSuccess()) {
+            log.error("reload plugin failed, cause pull config not success");
+            return;
+        }
+        for (InvokePlugin invokePlugin : invokePlugins) {
+            if (invokePlugin.enable(result.getData())) {
+                invokePlugin.unWatch(eventWatcher, invocationListener);
+            }
+        }
+        // release classloader
+        lifecycleManager.release();
+        // reWatch
+        initialize(result.getData());
+        moduleController.active();
+    }
+
+    /**
+     * 回放http接口(暴露JSON回放）
+     *
+     * @param req    请求参数
+     * @param writer printWriter
+     */
+    @Command("repeatWithJson")
+    public void repeatWithJson(final Map<String, String> req, final PrintWriter writer) {
+        try {
+            String data = req.get(Constants.DATA_TRANSPORT_IDENTIFY);
+            if (StringUtils.isEmpty(data)) {
+                writer.write("invalid request, cause parameter {" + Constants.DATA_TRANSPORT_IDENTIFY + "} is required");
+                return;
+            }
+            RepeatMeta meta = SerializerProvider.instance().provide(Serializer.Type.JSON).deserialize(data, RepeatMeta.class);
+            req.put(Constants.DATA_TRANSPORT_IDENTIFY, SerializerProvider.instance().provide(Serializer.Type.HESSIAN).serialize2String(meta));
+            repeat(req, writer);
+        } catch (Throwable e) {
+            writer.write(e.getMessage());
+        }
+    }
+
+    /**
      * 配置推送接口
      *
      * @param req    请求参数
@@ -252,6 +302,7 @@ public class RepeaterModule implements Module, ModuleLifecycle {
         }
         try {
             RepeaterConfig config = SerializerWrapper.hessianDeserialize(data, RepeaterConfig.class);
+            ApplicationModel.instance().setConfig(config);
             noticeConfigChange(config);
             writer.write("config push success");
         } catch (SerializeException e) {
@@ -268,7 +319,9 @@ public class RepeaterModule implements Module, ModuleLifecycle {
         if (initialized.get()) {
             for (InvokePlugin invokePlugin : invokePlugins) {
                 try {
-                    invokePlugin.onConfigChange(config);
+                    if (invokePlugin.enable(config)) {
+                        invokePlugin.onConfigChange(config);
+                    }
                 } catch (PluginLifeCycleException e) {
                     log.error("error occurred when notice config, plugin ={}", invokePlugin.getType().name(), e);
                 }
